@@ -1,0 +1,10 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>Your Resume Video</h1>
+<video width="640" height="360" controls>
+    <source src="{{ video_url }}" type="video/mp4">
+    Your browser does not support the video tag.
+</video>
+<p><a href="{{ video_url }}" download="resume_video.mp4">Download Video</a></p>
+<p><a href="{% url 'uploads' %}">Create Another</a> | <a href="{% url 'profile' %}">View Profile</a></p>
+{% endblock %}
