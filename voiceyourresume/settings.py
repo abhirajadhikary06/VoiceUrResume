@@ -44,6 +44,11 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
+AUTHENTICATION_BACKENDS = (
+    'social_core.backends.github.GithubOAuth2',  # Must be exactly this
+    'django.contrib.auth.backends.ModelBackend',  # Default Django backend
+)
+
 ROOT_URLCONF = 'voiceyourresume.urls'
 
 TEMPLATES = [
@@ -124,6 +129,6 @@ SOCIAL_AUTH_LOGIN_ERROR_URL = '/login/'
 LOGOUT_REDIRECT_URL = '/login/'
 
 STATIC_URL = '/static/'
-STATICFILES_DIRS = [BASE_DIR / "static"]
+STATICFILES_DIRS = [BASE_DIR / "converter" / "static"]
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')

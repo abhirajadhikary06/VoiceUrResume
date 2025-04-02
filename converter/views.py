@@ -1,29 +1,25 @@
 from django.shortcuts import render, redirect
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth import authenticate, login, logout
-from django.http import FileResponse
 from .forms import UploadForm
 from .models import Resume
 from PyPDF2 import PdfReader
 from docx import Document
 from transformers import pipeline
 from gtts import gTTS
-from moviepy import VideoFileClip, AudioFileClip
 import os
 from django.conf import settings
 from dotenv import load_dotenv
 import logging
-import requests
-import time
+import subprocess
 
 load_dotenv()
 
 # Pretrained models
-summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-6-6")
 
-# D-ID API settings
-D_ID_API_KEY = os.getenv('D_ID_API_KEY')
-D_ID_API_URL = "https://api.d-id.com/talks"
+# Sonic settings
+SONIC_SCRIPT = os.path.join(settings.BASE_DIR, 'Sonic', 'sonic.py')
 
 def login_page(request):
     if request.user.is_authenticated:
@@ -60,15 +56,15 @@ def convert(request, resume_id):
             doc = Document(resume_path)
             text = '\n'.join([para.text for para in doc.paragraphs])
 
-        # Summarize text
-        summary = summarizer(text, max_length=240, min_length=200, do_sample=False)[0]['summary_text']
+        # Summarize text (limit to ~150 words for <1 minute audio)
+        summary = summarizer(text, max_length=150, min_length=100, do_sample=False)[0]['summary_text']
 
         # Convert to speech
         audio_path = os.path.join(settings.MEDIA_ROOT, f'{request.user.id}_resume.mp3')
         tts = gTTS(text=summary, lang='en', slow=False)
         tts.save(audio_path)
 
-        # Face swap with D-ID
+        # Generate video with Sonic.py
         photo_data = resume.photo_file.read()
         swapped_video_path = deepfake_face_swap(photo_data, audio_path)
 
@@ -78,6 +74,8 @@ def convert(request, resume_id):
 
         # Cleanup
         os.remove(audio_path)
+        if os.path.exists(swapped_video_path):
+            os.remove(swapped_video_path)
 
         return redirect('converted', resume_id=resume.id)
     except Exception as e:
@@ -91,65 +89,41 @@ def converted(request, resume_id):
     video_url = resume.video_file.url
     return render(request, 'converted.html', {'video_url': video_url})
 
+@login_required
 def deepfake_face_swap(photo_data, audio_path):
     """
-    Use D-ID API to create a talking avatar video from a photo and audio.
+    Use Sonic.py (Portrait-Animation) to generate a lip-synced video from a photo and audio.
     Args:
         photo_data (bytes): Uploaded photo data (PNG/JPG).
         audio_path (str): Path to the generated audio file.
     Returns:
         str: Path to the final video file.
     """
-    # Prepare headers for D-ID API
-    headers = {
-        "Authorization": f"Bearer {D_ID_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    # Save photo temporarily
+    temp_photo_path = os.path.join(settings.MEDIA_ROOT, f'temp_{os.urandom(8).hex()}.jpg')
+    with open(temp_photo_path, 'wb') as f:
+        f.write(photo_data)
 
-    # Step 1: Upload photo and audio to D-ID
-    with open(audio_path, 'rb') as audio_file:
-        files = {
-            'source_url': ('photo.jpg', photo_data, 'image/jpeg'),  # Assuming JPG, adjust if PNG
-            'script': ('audio.mp3', audio_file, 'audio/mpeg')
-        }
-        payload = {
-            "script": {
-                "type": "audio",
-                "audio_url": "to-be-filled"  # Will be updated after upload
-            },
-            "source_url": "to-be-filled"  # Will be updated after upload
-        }
+    # Prepare output path
+    output_video_path = os.path.join(settings.MEDIA_ROOT, f'output_{os.urandom(8).hex()}.mp4')
 
-        # D-ID requires a public URL, but for simplicity, we'll use their upload endpoint
-        # In practice, you might need to upload to a public bucket first (e.g., S3)
-        # Here, we simulate direct upload (D-ID handles this internally via multipart)
-        response = requests.post(D_ID_API_URL, headers=headers, data={"script": {"type": "audio"}}, files=files)
-        if response.status_code != 201:
-            raise ValueError(f"D-ID API error: {response.text}")
-        
-        talk_id = response.json()['id']
+    # Path to Sonic.py script
+    sonic_script_path = os.path.join(settings.BASE_DIR, 'Portrait-Animation', 'inference.py')
 
-    # Step 2: Poll for the result
-    video_url = None
-    for _ in range(30):  # Poll for up to 5 minutes (adjust as needed)
-        response = requests.get(f"{D_ID_API_URL}/{talk_id}", headers=headers)
-        if response.status_code == 200 and response.json().get('status') == 'done':
-            video_url = response.json()['result_url']
-            break
-        time.sleep(10)  # Wait 10 seconds between polls
+    # Call Sonic.py inference
+    subprocess.run([
+        'python', sonic_script_path,
+        '--input_image', temp_photo_path,
+        '--audio', audio_path,
+        '--output', output_video_path
+    ])
 
-    if not video_url:
-        raise ValueError("D-ID video generation timed out or failed.")
-
-    # Step 3: Download the video
-    output_video_path = os.path.join(settings.MEDIA_ROOT, f'swapped_{os.urandom(8).hex()}.mp4')
-    video_response = requests.get(video_url)
-    with open(output_video_path, 'wb') as video_file:
-        video_file.write(video_response.content)
+    # Cleanup temporary photo
+    os.remove(temp_photo_path)
 
     return output_video_path
 
 @login_required
-def logout(request):
+def logout_view(request):
     logout(request)
     return redirect('login')
