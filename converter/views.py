@@ -8,19 +8,22 @@ from PyPDF2 import PdfReader
 from docx import Document
 from transformers import pipeline
 from gtts import gTTS
-from moviepy import VideoFileClip, AudioFileClip
-import cv2
-import numpy as np
-from insightface.app import FaceAnalysis
+from moviepy.editor import VideoFileClip, AudioFileClip
 import os
 from django.conf import settings
 from dotenv import load_dotenv
 import logging
+import requests
+import time
 
 load_dotenv()
 
 # Pretrained models
 summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+
+# D-ID API settings
+D_ID_API_KEY = os.getenv('D_ID_API_KEY')
+D_ID_API_URL = "https://api.d-id.com/talks"
 
 def login_page(request):
     if request.user.is_authenticated:
@@ -65,27 +68,19 @@ def convert(request, resume_id):
         tts = gTTS(text=summary, lang='en', slow=False)
         tts.save(audio_path)
 
-        # Face swap
-        stock_video = VideoFileClip("converter/static/stock_speaking_video.mp4")
+        # Face swap with D-ID
         photo_data = resume.photo_file.read()
-        swapped_video_path = deepfake_face_swap(stock_video, photo_data)
+        swapped_video_path = deepfake_face_swap(photo_data, audio_path)
 
-        # Combine audio and video
-        final_video = VideoFileClip(swapped_video_path).set_audio(AudioFileClip(audio_path))
-        output_path = os.path.join(settings.MEDIA_ROOT, f'{request.user.id}_resume_video.mp4')
-        final_video.write_videofile(output_path, codec='libx264', audio_codec='aac')
-
-        # Save video
+        # Save video to model
         resume.video_file.name = f'videos/{request.user.id}_resume_video.mp4'
         resume.save()
 
         # Cleanup
         os.remove(audio_path)
-        os.remove(swapped_video_path)
 
         return redirect('converted', resume_id=resume.id)
     except Exception as e:
-        # Log the error for debugging
         logger = logging.getLogger(__name__)
         logger.error(f"Error in convert function: {str(e)}")
         return render(request, 'uploads.html', {'form': UploadForm(), 'error': 'An error occurred during conversion.'})
@@ -96,44 +91,65 @@ def converted(request, resume_id):
     video_url = resume.video_file.url
     return render(request, 'converted.html', {'video_url': video_url})
 
-def deepfake_face_swap(video_clip, photo_data):
-    app = FaceAnalysis()  # Initialize the FaceAnalysis app
-    app.prepare(ctx_id=0, det_size=(640, 640))  # Prepare the app with appropriate settings
-    photo_array = np.frombuffer(photo_data, np.uint8)
-    source_img = cv2.imdecode(photo_array, cv2.IMREAD_COLOR)
-    source_faces = app.get(source_img)
-    if not source_faces:
-        raise ValueError("No face detected in photo!")
-    source_face = source_faces[0]
+def deepfake_face_swap(photo_data, audio_path):
+    """
+    Use D-ID API to create a talking avatar video from a photo and audio.
+    Args:
+        photo_data (bytes): Uploaded photo data (PNG/JPG).
+        audio_path (str): Path to the generated audio file.
+    Returns:
+        str: Path to the final video file.
+    """
+    # Prepare headers for D-ID API
+    headers = {
+        "Authorization": f"Bearer {D_ID_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-    temp_video_path = os.path.join(settings.MEDIA_ROOT, 'temp_video.mp4')
-    output_video = os.path.join(settings.MEDIA_ROOT, f'swapped_{os.urandom(8).hex()}.mp4')
-    video_clip.write_videofile(temp_video_path, codec='libx264', audio=False, logger=None)
+    # Step 1: Upload photo and audio to D-ID
+    with open(audio_path, 'rb') as audio_file:
+        files = {
+            'source_url': ('photo.jpg', photo_data, 'image/jpeg'),  # Assuming JPG, adjust if PNG
+            'script': ('audio.mp3', audio_file, 'audio/mpeg')
+        }
+        payload = {
+            "script": {
+                "type": "audio",
+                "audio_url": "to-be-filled"  # Will be updated after upload
+            },
+            "source_url": "to-be-filled"  # Will be updated after upload
+        }
 
-    cap = cv2.VideoCapture(temp_video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # D-ID requires a public URL, but for simplicity, we'll use their upload endpoint
+        # In practice, you might need to upload to a public bucket first (e.g., S3)
+        # Here, we simulate direct upload (D-ID handles this internally via multipart)
+        response = requests.post(D_ID_API_URL, headers=headers, data={"script": {"type": "audio"}}, files=files)
+        if response.status_code != 201:
+            raise ValueError(f"D-ID API error: {response.text}")
+        
+        talk_id = response.json()['id']
 
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_video, fourcc, fps, (width, height))  # Corrected variable name
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
+    # Step 2: Poll for the result
+    video_url = None
+    for _ in range(30):  # Poll for up to 5 minutes (adjust as needed)
+        response = requests.get(f"{D_ID_API_URL}/{talk_id}", headers=headers)
+        if response.status_code == 200 and response.json().get('status') == 'done':
+            video_url = response.json()['result_url']
             break
-        faces = app.get(frame)
-        if faces:
-            for face in faces:
-                frame = swapper.get(frame, face, source_face, paste_back=True)
-        out.write(frame)
+        time.sleep(10)  # Wait 10 seconds between polls
 
-    cap.release()
-    out.release()
-    os.remove(temp_video_path)
-    return output_video
+    if not video_url:
+        raise ValueError("D-ID video generation timed out or failed.")
+
+    # Step 3: Download the video
+    output_video_path = os.path.join(settings.MEDIA_ROOT, f'swapped_{os.urandom(8).hex()}.mp4')
+    video_response = requests.get(video_url)
+    with open(output_video_path, 'wb') as video_file:
+        video_file.write(video_response.content)
+
+    return output_video_path
 
 @login_required
 def logout(request):
-    logout(request)  # Log the user out
+    logout(request)
     return redirect('login')
