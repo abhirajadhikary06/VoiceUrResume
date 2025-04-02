@@ -8,7 +8,7 @@ from PyPDF2 import PdfReader
 from docx import Document
 from transformers import pipeline
 from gtts import gTTS
-from moviepy.editor import VideoFileClip, AudioFileClip
+from moviepy import VideoFileClip, AudioFileClip
 import os
 from django.conf import settings
 from dotenv import load_dotenv
